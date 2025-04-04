@@ -11,9 +11,11 @@
 (define-constant ERR-INSUFFICIENT-TOKENS (err u104))
 (define-constant ERR-ALREADY-VOTED (err u105))
 (define-constant ERR-PROPOSAL-ACTIVE (err u106))
+(define-constant ERR-COMMENT-TOO-LONG (err u107))
 
 ;; data vars
 (define-data-var proposal-count uint u0)
+(define-data-var comment-count uint u0)
 
 ;; data maps
 ;; Map to store proposal details
@@ -28,7 +30,8 @@
     executed: bool,
     yes-votes: uint,
     no-votes: uint,
-    min-tokens-to-create: uint
+    min-tokens-to-create: uint,
+    quorum: uint  ;; Add this field
   }
 )
 
@@ -44,10 +47,32 @@
   { vote: bool, weight: uint }
 )
 
+;; Map to store proposal categories
+(define-map proposal-categories
+  { proposal-id: uint }
+  { category: (string-utf8 20) }
+)
+
+;; Map to store proposal comments
+(define-map proposal-comments
+  { proposal-id: uint, comment-id: uint }
+  {
+    author: principal,
+    content: (string-utf8 200),
+    block-height: uint
+  }
+)
+
+;; Map to store delegations
+(define-map delegations
+  { delegator: principal }
+  { delegate: principal }
+)
+
 ;; public functions
 
 ;; Create a new proposal
-(define-public (create-proposal (title (string-utf8 100)) (description (string-utf8 500)) (duration uint) (min-tokens uint))
+(define-public (create-proposal (title (string-utf8 100)) (description (string-utf8 500)) (duration uint) (min-tokens uint) (quorum uint))
   (let
     (
       (proposal-id (var-get proposal-count))
@@ -71,7 +96,8 @@
         executed: false,
         yes-votes: u0,
         no-votes: u0,
-        min-tokens-to-create: min-tokens
+        min-tokens-to-create: min-tokens,
+        quorum: quorum
       }
     )
     
@@ -185,6 +211,65 @@
   )
 )
 
+;; Set proposal category
+(define-public (set-proposal-category (proposal-id uint) (category (string-utf8 20)))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+    )
+    ;; Only creator can set category
+    (asserts! (is-eq tx-sender (get creator proposal)) ERR-NOT-AUTHORIZED)
+    
+    (map-set proposal-categories
+      { proposal-id: proposal-id }
+      { category: category }
+    )
+    (ok true)
+  )
+)
+
+;; Add comment to proposal
+(define-public (add-comment (proposal-id uint) (content (string-utf8 200)))
+  (let
+    (
+      (comment-id (var-get comment-count))
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+    )
+    
+    (map-set proposal-comments
+      { proposal-id: proposal-id, comment-id: comment-id }
+      {
+        author: tx-sender,
+        content: content,
+        block-height: stacks-block-height
+      }
+    )
+    
+    (var-set comment-count (+ comment-id u1))
+    (ok comment-id)
+  )
+)
+
+;; Delegate vote
+(define-public (delegate-vote (delegate-to principal))
+  (begin
+    (asserts! (not (is-eq tx-sender delegate-to)) ERR-NOT-AUTHORIZED)
+    (map-set delegations
+      { delegator: tx-sender }
+      { delegate: delegate-to }
+    )
+    (ok true)
+  )
+)
+
+;; Remove delegation
+(define-public (remove-delegation)
+  (begin
+    (map-delete delegations { delegator: tx-sender })
+    (ok true)
+  )
+)
+
 ;; read only functions
 
 ;; Get proposal details
@@ -215,4 +300,143 @@
     )
     (ok (> (get yes-votes proposal) (get no-votes proposal)))
   )
+)
+
+;; Get proposal category
+(define-read-only (get-proposal-category (proposal-id uint))
+  (map-get? proposal-categories { proposal-id: proposal-id })
+)
+
+;; Get comment details
+(define-read-only (get-comment (proposal-id uint) (comment-id uint))
+  (map-get? proposal-comments { proposal-id: proposal-id, comment-id: comment-id })
+)
+
+;; Get delegate
+(define-read-only (get-delegate (user principal))
+  (map-get? delegations { delegator: user })
+)
+
+;; Check if quorum is reached
+(define-read-only (check-quorum-reached (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+      (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
+    )
+    (ok (>= total-votes (get quorum proposal)))
+  )
+)
+
+
+
+
+;; Add to constants
+(define-constant ERR-CANNOT-CANCEL (err u108))
+
+;; Add new public function
+(define-public (cancel-proposal (proposal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+            (current-block stacks-block-height)
+        )
+        ;; Only creator can cancel and only before voting ends
+        (asserts! (is-eq tx-sender (get creator proposal)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= current-block (get end-block-height proposal)) ERR-CANNOT-CANCEL)
+        (asserts! (not (get executed proposal)) ERR-CANNOT-CANCEL)
+        
+        (map-set proposals
+            { proposal-id: proposal-id }
+            (merge proposal { executed: true })
+        )
+        (ok true)
+    )
+)
+
+;; Add to data maps
+(define-map token-locks
+    { user: principal }
+    {
+        amount: uint,
+        lock-until: uint,
+        multiplier: uint
+    }
+)
+
+;; Add new public function
+(define-public (lock-tokens (amount uint) (duration uint))
+    (let
+        (
+            (current-block stacks-block-height)
+            (multiplier (if (>= duration u50000) u2 u1))
+            (lock-end (+ current-block duration))
+        )
+        
+        (map-set token-locks
+            { user: tx-sender }
+            {
+                amount: amount,
+                lock-until: lock-end,
+                multiplier: multiplier
+            }
+        )
+        (ok true)
+    )
+)
+
+;; Add new read-only function
+(define-read-only (get-voting-power (user principal))
+    (let
+        (
+            (lock-info (default-to { amount: u0, lock-until: u0, multiplier: u1 } 
+                (map-get? token-locks { user: user })))
+        )
+        (ok (* (get amount lock-info) (get multiplier lock-info)))
+    )
+)
+
+;; Add to data maps
+(define-map proposal-templates
+    { template-id: uint }
+    {
+        name: (string-utf8 50),
+        description: (string-utf8 500),
+        duration: uint,
+        min-tokens: uint,
+        quorum: uint
+    }
+)
+
+(define-data-var template-count uint u0)
+
+;; Add new public functions
+(define-public (create-template 
+    (name (string-utf8 50))
+    (description (string-utf8 500))
+    (duration uint)
+    (min-tokens uint)
+    (quorum uint))
+    (let
+        (
+            (template-id (var-get template-count))
+        )
+        (map-set proposal-templates
+            { template-id: template-id }
+            {
+                name: name,
+                description: description,
+                duration: duration,
+                min-tokens: min-tokens,
+                quorum: quorum
+            }
+        )
+        (var-set template-count (+ template-id u1))
+        (ok template-id)
+    )
+)
+
+;; Add new read-only function
+(define-read-only (get-template (template-id uint))
+    (map-get? proposal-templates { template-id: template-id })
 )
