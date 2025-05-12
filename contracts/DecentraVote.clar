@@ -80,7 +80,8 @@
       (start-block stacks-block-height)
       (end-block (+ start-block duration))
     )
-    
+    (asserts! (not (var-get contract-paused)) ERR-PAUSED)
+
     ;; Check if user has staked enough tokens to create a proposal
     (asserts! (>= (get amount user-stake) min-tokens) ERR-INSUFFICIENT-TOKENS)
     
@@ -115,7 +116,8 @@
       (current-stake (default-to { amount: u0 } (map-get? user-stakes { user: tx-sender })))
       (new-amount (+ (get amount current-stake) amount))
     )
-    
+    (asserts! (not (var-get contract-paused)) ERR-PAUSED)
+
     ;; Update user stake
     (map-set user-stakes
       { user: tx-sender }
@@ -132,7 +134,8 @@
     (
       (current-stake (default-to { amount: u0 } (map-get? user-stakes { user: tx-sender })))
     )
-    
+    (asserts! (not (var-get contract-paused)) ERR-PAUSED)
+
     ;; Check if user has enough staked tokens
     (asserts! (>= (get amount current-stake) amount) ERR-INSUFFICIENT-TOKENS)
     
@@ -154,7 +157,8 @@
       (user-stake (default-to { amount: u0 } (map-get? user-stakes { user: tx-sender })))
       (current-block stacks-block-height)
     )
-    
+    (asserts! (not (var-get contract-paused)) ERR-PAUSED)
+
     ;; Check if voting is still open
     (asserts! (<= current-block (get end-block-height proposal)) ERR-VOTING-CLOSED)
     
@@ -193,7 +197,8 @@
       (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
       (current-block stacks-block-height)
     )
-    
+    (asserts! (not (var-get contract-paused)) ERR-PAUSED)
+
     ;; Check if voting period has ended
     (asserts! (> current-block (get end-block-height proposal)) ERR-PROPOSAL-ACTIVE)
     
@@ -217,6 +222,8 @@
     (
       (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
     )
+    (asserts! (not (var-get contract-paused)) ERR-PAUSED)
+
     ;; Only creator can set category
     (asserts! (is-eq tx-sender (get creator proposal)) ERR-NOT-AUTHORIZED)
     
@@ -235,7 +242,8 @@
       (comment-id (var-get comment-count))
       (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
     )
-    
+    (asserts! (not (var-get contract-paused)) ERR-PAUSED)
+
     (map-set proposal-comments
       { proposal-id: proposal-id, comment-id: comment-id }
       {
@@ -253,6 +261,8 @@
 ;; Delegate vote
 (define-public (delegate-vote (delegate-to principal))
   (begin
+  (asserts! (not (var-get contract-paused)) ERR-PAUSED)
+
     (asserts! (not (is-eq tx-sender delegate-to)) ERR-NOT-AUTHORIZED)
     (map-set delegations
       { delegator: tx-sender }
@@ -341,6 +351,8 @@
             (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
             (current-block stacks-block-height)
         )
+        (asserts! (not (var-get contract-paused)) ERR-PAUSED)
+
         ;; Only creator can cancel and only before voting ends
         (asserts! (is-eq tx-sender (get creator proposal)) ERR-NOT-AUTHORIZED)
         (asserts! (<= current-block (get end-block-height proposal)) ERR-CANNOT-CANCEL)
@@ -439,4 +451,137 @@
 ;; Add new read-only function
 (define-read-only (get-template (template-id uint))
     (map-get? proposal-templates { template-id: template-id })
+)
+
+
+(define-constant CONTRACT-OWNER tx-sender)
+(define-constant ERR-NOT-OWNER (err u109))
+(define-constant ERR-PAUSED (err u110))
+
+(define-data-var contract-paused bool false)
+
+(define-public (toggle-pause)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-OWNER)
+        (ok (var-set contract-paused (not (var-get contract-paused))))
+    )
+)
+
+(define-read-only (is-paused)
+    (var-get contract-paused)
+)
+
+
+(define-constant ERR-ENDORSEMENT-EXISTS (err u111))
+(define-constant ERR-INVALID-PROPOSAL-STATE (err u112))
+
+(define-map proposal-endorsements
+    { proposal-id: uint, endorser: principal }
+    { endorsed: bool }
+)
+
+(define-map endorsement-counts
+    { proposal-id: uint }
+    { count: uint }
+)
+
+(define-public (endorse-proposal (proposal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+            (current-block stacks-block-height)
+        )
+        (asserts! (< current-block (get start-block-height proposal)) ERR-INVALID-PROPOSAL-STATE)
+        (asserts! (is-none (map-get? proposal-endorsements { proposal-id: proposal-id, endorser: tx-sender })) ERR-ENDORSEMENT-EXISTS)
+        
+        (map-set proposal-endorsements
+            { proposal-id: proposal-id, endorser: tx-sender }
+            { endorsed: true }
+        )
+        
+        (map-set endorsement-counts
+            { proposal-id: proposal-id }
+            { count: (+ (get count (default-to { count: u0 } (map-get? endorsement-counts { proposal-id: proposal-id }))) u1) }
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-endorsement-count (proposal-id uint))
+    (default-to { count: u0 } (map-get? endorsement-counts { proposal-id: proposal-id }))
+)
+
+
+(define-constant ERR-MILESTONE-EXISTS (err u113))
+(define-constant ERR-MILESTONE-NOT-FOUND (err u114))
+(define-constant ERR-INVALID-MILESTONE-STATE (err u115))
+
+(define-map proposal-milestones
+    { proposal-id: uint, milestone-id: uint }
+    {
+        title: (string-utf8 100),
+        description: (string-utf8 200),
+        deadline: uint,
+        completed: bool
+    }
+)
+
+(define-map milestone-counts
+    { proposal-id: uint }
+    { count: uint }
+)
+
+(define-public (add-milestone 
+    (proposal-id uint) 
+    (title (string-utf8 100)) 
+    (description (string-utf8 200)) 
+    (deadline uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+            (milestone-count (default-to { count: u0 } (map-get? milestone-counts { proposal-id: proposal-id })))
+        )
+        (asserts! (is-eq tx-sender (get creator proposal)) ERR-NOT-AUTHORIZED)
+        
+        (map-set proposal-milestones
+            { proposal-id: proposal-id, milestone-id: (get count milestone-count) }
+            {
+                title: title,
+                description: description,
+                deadline: deadline,
+                completed: false
+            }
+        )
+        
+        (map-set milestone-counts
+            { proposal-id: proposal-id }
+            { count: (+ (get count milestone-count) u1) }
+        )
+        (ok (get count milestone-count))
+    )
+)
+
+(define-public (complete-milestone (proposal-id uint) (milestone-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+            (milestone (unwrap! (map-get? proposal-milestones { proposal-id: proposal-id, milestone-id: milestone-id }) ERR-MILESTONE-NOT-FOUND))
+        )
+        (asserts! (is-eq tx-sender (get creator proposal)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get completed milestone)) ERR-INVALID-MILESTONE-STATE)
+        
+        (map-set proposal-milestones
+            { proposal-id: proposal-id, milestone-id: milestone-id }
+            (merge milestone { completed: true })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-milestone (proposal-id uint) (milestone-id uint))
+    (map-get? proposal-milestones { proposal-id: proposal-id, milestone-id: milestone-id })
+)
+
+(define-read-only (get-milestone-count (proposal-id uint))
+    (default-to { count: u0 } (map-get? milestone-counts { proposal-id: proposal-id }))
 )
