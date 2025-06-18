@@ -82,6 +82,9 @@
     )
     (asserts! (not (var-get contract-paused)) ERR-PAUSED)
 
+    (award-reputation-points tx-sender u10 "proposal-creation")
+
+
     ;; Check if user has staked enough tokens to create a proposal
     (asserts! (>= (get amount user-stake) min-tokens) ERR-INSUFFICIENT-TOKENS)
     
@@ -168,6 +171,8 @@
     ;; Check if user has already voted
     (asserts! (is-none (map-get? votes { proposal-id: proposal-id, voter: tx-sender })) ERR-ALREADY-VOTED)
     
+    (award-reputation-points tx-sender u5 "voting")
+
     ;; Record the vote
     (map-set votes
       { proposal-id: proposal-id, voter: tx-sender }
@@ -584,4 +589,239 @@
 
 (define-read-only (get-milestone-count (proposal-id uint))
     (default-to { count: u0 } (map-get? milestone-counts { proposal-id: proposal-id }))
+)
+
+(define-constant ERR-REPUTATION-OVERFLOW (err u116))
+
+(define-map user-reputation
+  { user: principal }
+  {
+    total-points: uint,
+    proposals-created: uint,
+    successful-proposals: uint,
+    votes-cast: uint,
+    majority-votes: uint,
+    participation-streak: uint,
+    last-activity-block: uint
+  }
+)
+
+(define-map reputation-levels
+  { level: uint }
+  {
+    name: (string-utf8 20),
+    min-points: uint,
+    voting-bonus: uint
+  }
+)
+
+(define-data-var reputation-initialized bool false)
+
+(define-private (initialize-reputation-levels)
+  (begin
+    (map-set reputation-levels { level: u1 } { name: u"Newcomer", min-points: u0, voting-bonus: u0 })
+    (map-set reputation-levels { level: u2 } { name: u"Contributor", min-points: u100, voting-bonus: u5 })
+    (map-set reputation-levels { level: u3 } { name: u"Veteran", min-points: u500, voting-bonus: u10 })
+    (map-set reputation-levels { level: u4 } { name: u"Expert", min-points: u1000, voting-bonus: u20 })
+    (map-set reputation-levels { level: u5 } { name: u"Guardian", min-points: u2500, voting-bonus: u50 })
+    (var-set reputation-initialized true)
+  )
+)
+
+(define-private (ensure-reputation-initialized)
+  (if (not (var-get reputation-initialized))
+    (initialize-reputation-levels)
+    true
+  )
+)
+
+(define-private (get-user-reputation-data (user principal))
+  (default-to 
+    {
+      total-points: u0,
+      proposals-created: u0,
+      successful-proposals: u0,
+      votes-cast: u0,
+      majority-votes: u0,
+      participation-streak: u0,
+      last-activity-block: u0
+    }
+    (map-get? user-reputation { user: user })
+  )
+)
+
+(define-private (update-participation-streak (user principal) (current-block uint))
+  (let
+    (
+      (user-rep (get-user-reputation-data user))
+      (last-block (get last-activity-block user-rep))
+      (block-diff (- current-block last-block))
+    )
+    (if (and (> last-block u0) (<= block-diff u2016))
+      (+ (get participation-streak user-rep) u1)
+      u1
+    )
+  )
+)
+
+(define-private (award-reputation-points (user principal) (points uint) (activity-type (string-ascii 20)))
+  (let
+    (
+      (current-rep (get-user-reputation-data user))
+      (current-block stacks-block-height)
+      (new-streak (update-participation-streak user current-block))
+      (streak-bonus (if (> new-streak u10) u10 u0))
+      (total-new-points (+ points streak-bonus))
+    )
+    (ensure-reputation-initialized)
+    (map-set user-reputation
+      { user: user }
+      (merge current-rep 
+        {
+          total-points: (+ (get total-points current-rep) total-new-points),
+          participation-streak: new-streak,
+          last-activity-block: current-block
+        }
+      )
+    )
+  )
+)
+
+(define-private (update-proposal-reputation (user principal) (successful bool))
+  (let
+    (
+      (current-rep (get-user-reputation-data user))
+      (points (if successful u50 u10))
+    )
+    (map-set user-reputation
+      { user: user }
+      (merge current-rep
+        {
+          proposals-created: (+ (get proposals-created current-rep) u1),
+          successful-proposals: (if successful 
+            (+ (get successful-proposals current-rep) u1)
+            (get successful-proposals current-rep)
+          )
+        }
+      )
+    )
+    (award-reputation-points user points "proposal")
+  )
+)
+
+(define-private (update-voting-reputation (user principal) (voted-with-majority bool))
+  (let
+    (
+      (current-rep (get-user-reputation-data user))
+      (points (if voted-with-majority u20 u5))
+    )
+    (map-set user-reputation
+      { user: user }
+      (merge current-rep
+        {
+          votes-cast: (+ (get votes-cast current-rep) u1),
+          majority-votes: (if voted-with-majority
+            (+ (get majority-votes current-rep) u1)
+            (get majority-votes current-rep)
+          )
+        }
+      )
+    )
+    (award-reputation-points user points "voting")
+  )
+)
+
+(define-public (finalize-proposal-reputation (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+      (proposal-passed (> (get yes-votes proposal) (get no-votes proposal)))
+    )
+    (asserts! (get executed proposal) ERR-INVALID-PROPOSAL-STATE)
+    (update-proposal-reputation (get creator proposal) proposal-passed)
+    (ok proposal-passed)
+  )
+)
+
+(define-public (update-voter-reputation (proposal-id uint) (voter principal))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+      (vote-data (unwrap! (map-get? votes { proposal-id: proposal-id, voter: voter }) ERR-PROPOSAL-NOT-FOUND))
+      (proposal-passed (> (get yes-votes proposal) (get no-votes proposal)))
+      (voted-with-majority (is-eq (get vote vote-data) proposal-passed))
+    )
+    (asserts! (get executed proposal) ERR-INVALID-PROPOSAL-STATE)
+    (update-voting-reputation voter voted-with-majority)
+    (ok voted-with-majority)
+  )
+)
+
+(define-read-only (get-user-reputation (user principal))
+  (let
+    (
+      (user-rep (get-user-reputation-data user))
+    )
+    (ok user-rep)
+  )
+)
+
+(define-read-only (get-user-level (user principal))
+  (let
+    (
+      (user-rep (get-user-reputation-data user))
+      (points (get total-points user-rep))
+    )
+    (if (>= points u2500) u5
+      (if (>= points u1000) u4
+        (if (>= points u500) u3
+          (if (>= points u100) u2 u1)
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-level-info (level uint))
+  (begin
+    (map-get? reputation-levels { level: level })
+  )
+)
+
+(define-read-only (get-user-voting-accuracy (user principal))
+  (let
+    (
+      (user-rep (get-user-reputation-data user))
+      (total-votes (get votes-cast user-rep))
+      (majority-votes (get majority-votes user-rep))
+    )
+    (if (> total-votes u0)
+      (some (/ (* majority-votes u100) total-votes))
+      none
+    )
+  )
+)
+
+(define-read-only (get-user-proposal-success-rate (user principal))
+  (let
+    (
+      (user-rep (get-user-reputation-data user))
+      (total-proposals (get proposals-created user-rep))
+      (successful-proposals (get successful-proposals user-rep))
+    )
+    (if (> total-proposals u0)
+      (some (/ (* successful-proposals u100) total-proposals))
+      none
+    )
+  )
+)
+
+(define-read-only (calculate-reputation-bonus (user principal))
+  (let
+    (
+      (user-level (get-user-level user))
+      (level-info (unwrap! (get-level-info user-level) u0))
+    )
+    (get voting-bonus level-info)
+  )
 )
