@@ -68,10 +68,34 @@
   { delegator: principal }
   { delegate: principal }
 )
+(define-map batch-vote-results
+  { batch-id: uint }
+  {
+    voter: principal,
+    successful-votes: uint,
+    failed-votes: uint,
+    total-proposals: uint
+  }
+)
+
+(define-data-var batch-count uint u0)
+
+
+;; Map to store proposal snapshots
+(define-map proposal-snapshots
+  { proposal-id: uint }
+  { snapshot-block: uint }
+)
+
+;; Map to store voting power at snapshot
+(define-map snapshot-voting-power
+  { proposal-id: uint, user: principal }
+  { power: uint }
+)
 
 ;; public functions
 
-;; Create a new proposal
+;; Create a new proposal with snapshot
 (define-public (create-proposal (title (string-utf8 100)) (description (string-utf8 500)) (duration uint) (min-tokens uint) (quorum uint))
   (let
     (
@@ -83,7 +107,6 @@
     (asserts! (not (var-get contract-paused)) ERR-PAUSED)
 
     (award-reputation-points tx-sender u10 "proposal-creation")
-
 
     ;; Check if user has staked enough tokens to create a proposal
     (asserts! (>= (get amount user-stake) min-tokens) ERR-INSUFFICIENT-TOKENS)
@@ -103,6 +126,12 @@
         min-tokens-to-create: min-tokens,
         quorum: quorum
       }
+    )
+    
+    ;; Create voting power snapshot at current block
+    (map-set proposal-snapshots
+      { proposal-id: proposal-id }
+      { snapshot-block: start-block }
     )
     
     ;; Increment proposal count
@@ -152,12 +181,15 @@
   )
 )
 
-;; Vote on a proposal
+;; Vote on a proposal using snapshot
 (define-public (vote (proposal-id uint) (vote-value bool))
   (let
     (
       (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
-      (user-stake (default-to { amount: u0 } (map-get? user-stakes { user: tx-sender })))
+      (snapshot-power (map-get? snapshot-voting-power { proposal-id: proposal-id, user: tx-sender }))
+      (voting-power (if (is-some snapshot-power) 
+                      (get power (unwrap-panic snapshot-power))
+                      (get amount (default-to { amount: u0 } (map-get? user-stakes { user: tx-sender })))))
       (current-block stacks-block-height)
     )
     (asserts! (not (var-get contract-paused)) ERR-PAUSED)
@@ -165,8 +197,8 @@
     ;; Check if voting is still open
     (asserts! (<= current-block (get end-block-height proposal)) ERR-VOTING-CLOSED)
     
-    ;; Check if user has staked tokens
-    (asserts! (> (get amount user-stake) u0) ERR-INSUFFICIENT-TOKENS)
+    ;; Check if user has voting power
+    (asserts! (> voting-power u0) ERR-INSUFFICIENT-TOKENS)
     
     ;; Check if user has already voted
     (asserts! (is-none (map-get? votes { proposal-id: proposal-id, voter: tx-sender })) ERR-ALREADY-VOTED)
@@ -176,18 +208,18 @@
     ;; Record the vote
     (map-set votes
       { proposal-id: proposal-id, voter: tx-sender }
-      { vote: vote-value, weight: (get amount user-stake) }
+      { vote: vote-value, weight: voting-power }
     )
     
     ;; Update vote tallies
     (if vote-value
       (map-set proposals
         { proposal-id: proposal-id }
-        (merge proposal { yes-votes: (+ (get yes-votes proposal) (get amount user-stake)) })
+        (merge proposal { yes-votes: (+ (get yes-votes proposal) voting-power) })
       )
       (map-set proposals
         { proposal-id: proposal-id }
-        (merge proposal { no-votes: (+ (get no-votes proposal) (get amount user-stake)) })
+        (merge proposal { no-votes: (+ (get no-votes proposal) voting-power) })
       )
     )
     
@@ -330,6 +362,31 @@
 ;; Get delegate
 (define-read-only (get-delegate (user principal))
   (map-get? delegations { delegator: user })
+)
+
+;; Record user voting power at snapshot
+(define-public (record-snapshot-power (proposal-id uint) (user principal))
+  (let
+    (
+      (user-stake (default-to { amount: u0 } (map-get? user-stakes { user: user })))
+      (snapshot-data (unwrap! (map-get? proposal-snapshots { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+    )
+    (map-set snapshot-voting-power
+      { proposal-id: proposal-id, user: user }
+      { power: (get amount user-stake) }
+    )
+    (ok true)
+  )
+)
+
+;; Get snapshot voting power for user
+(define-read-only (get-snapshot-power (proposal-id uint) (user principal))
+  (map-get? snapshot-voting-power { proposal-id: proposal-id, user: user })
+)
+
+;; Get snapshot block for proposal
+(define-read-only (get-snapshot-block (proposal-id uint))
+  (map-get? proposal-snapshots { proposal-id: proposal-id })
 )
 
 ;; Check if quorum is reached
@@ -592,6 +649,8 @@
 )
 
 (define-constant ERR-REPUTATION-OVERFLOW (err u116))
+(define-constant ERR-BATCH-TOO-LARGE (err u117))
+(define-constant ERR-BATCH-EMPTY (err u118))
 
 (define-map user-reputation
   { user: principal }
@@ -823,5 +882,141 @@
       (level-info (unwrap! (get-level-info user-level) u0))
     )
     (get voting-bonus level-info)
+  )
+)
+
+
+(define-private (process-single-vote (proposal-id uint) (vote-value bool) (voter principal))
+  (let
+    (
+      (proposal (map-get? proposals { proposal-id: proposal-id }))
+      (current-block stacks-block-height)
+    )
+    (match proposal
+      some-proposal
+        (let
+          (
+            (snapshot-power (map-get? snapshot-voting-power { proposal-id: proposal-id, user: voter }))
+            (voting-power (if (is-some snapshot-power) 
+                           (get power (unwrap-panic snapshot-power))
+                           (get amount (default-to { amount: u0 } (map-get? user-stakes { user: voter })))))
+          )
+          (if (and 
+                (<= current-block (get end-block-height some-proposal))
+                (> voting-power u0)
+                (is-none (map-get? votes { proposal-id: proposal-id, voter: voter })))
+            (begin
+              (map-set votes
+                { proposal-id: proposal-id, voter: voter }
+                { vote: vote-value, weight: voting-power }
+              )
+              (if vote-value
+                (map-set proposals
+                  { proposal-id: proposal-id }
+                  (merge some-proposal { yes-votes: (+ (get yes-votes some-proposal) voting-power) })
+                )
+                (map-set proposals
+                  { proposal-id: proposal-id }
+                  (merge some-proposal { no-votes: (+ (get no-votes some-proposal) voting-power) })
+                )
+              )
+              (ok true)
+            )
+            (err false)
+          )
+        )
+      (err false)
+    )
+  )
+)
+
+(define-private (is-ok-response (resp (response bool bool)))
+  (match resp
+    ok-value true
+    err-value false
+  )
+)
+
+(define-private (process-batch-votes (votes-list (list 20 { proposal-id: uint, vote: bool })) (voter principal))
+  (let
+    (
+      (results (map process-single-vote-helper votes-list))
+      (successful-count (len (filter is-ok-response results)))
+      (failed-count (- (len results) successful-count))
+    )
+    {
+      successful-votes: successful-count,
+      failed-votes: failed-count,
+      total-proposals: (len results)
+    }
+  )
+)
+
+(define-private (process-single-vote-helper (vote-item { proposal-id: uint, vote: bool }))
+  (process-single-vote (get proposal-id vote-item) (get vote vote-item) tx-sender)
+)
+
+(define-public (batch-vote (votes-list (list 20 { proposal-id: uint, vote: bool })))
+  (let
+    (
+      (batch-id (var-get batch-count))
+      (votes-count (len votes-list))
+    )
+    (asserts! (not (var-get contract-paused)) ERR-PAUSED)
+    (asserts! (> votes-count u0) ERR-BATCH-EMPTY)
+    (asserts! (<= votes-count u20) ERR-BATCH-TOO-LARGE)
+    
+    (let
+      (
+        (batch-results (process-batch-votes votes-list tx-sender))
+      )
+      (map-set batch-vote-results
+        { batch-id: batch-id }
+        (merge batch-results { voter: tx-sender })
+      )
+      
+      (var-set batch-count (+ batch-id u1))
+      (award-reputation-points tx-sender (* (get successful-votes batch-results) u5) "batch-voting")
+      
+      (ok {
+        batch-id: batch-id,
+        successful-votes: (get successful-votes batch-results),
+        failed-votes: (get failed-votes batch-results),
+        total-proposals: (get total-proposals batch-results)
+      })
+    )
+  )
+)
+
+(define-read-only (get-batch-vote-results (batch-id uint))
+  (map-get? batch-vote-results { batch-id: batch-id })
+)
+
+(define-read-only (get-batch-count)
+  (var-get batch-count)
+)
+
+(define-read-only (can-vote-on-proposal (proposal-id uint) (voter principal))
+  (let
+    (
+      (proposal (map-get? proposals { proposal-id: proposal-id }))
+      (current-block stacks-block-height)
+    )
+    (match proposal
+      some-proposal
+        (let
+          (
+            (snapshot-power (map-get? snapshot-voting-power { proposal-id: proposal-id, user: voter }))
+            (voting-power (if (is-some snapshot-power) 
+                           (get power (unwrap-panic snapshot-power))
+                           (get amount (default-to { amount: u0 } (map-get? user-stakes { user: voter })))))
+          )
+          (and 
+            (<= current-block (get end-block-height some-proposal))
+            (> voting-power u0)
+            (is-none (map-get? votes { proposal-id: proposal-id, voter: voter })))
+        )
+      false
+    )
   )
 )
